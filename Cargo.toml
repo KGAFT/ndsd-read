@@ -1,0 +1,26 @@
+[package]
+name = "ndsd-read"
+version = "0.1.0"
+edition = "2024"
+description = "A lightweight library in rust for reading dsd files"
+license = "Apache-2.0"
+repository = "https://github.com/KGAFT/ndsd-read"
+categories = ["multimedia::audio"]
+keywords = ["dsd", "native"]
+
+[features]
+dstdec = []
+
+[dependencies]
+id3 = "1.16.4"
+byteorder = "1.5"
+chardetng = { version = "0.1" }
+encoding_rs = { version = "0.8", features = ["default"] }
+walkdir = "2"
+
+
+[build-dependencies]
+cc = "1.2.56"
+walkdir = "2"
+bindgen = "0.72.1"
+parse_cfg = "4"
