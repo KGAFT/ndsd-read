@@ -1,13 +1,13 @@
 [package]
 name = "ndsd-read"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "A lightweight library in rust for reading dsd files"
 license = "Apache-2.0"
 repository = "https://github.com/KGAFT/ndsd-read"
 categories = ["multimedia::audio"]
 keywords = ["dsd", "native"]
-
+readme = "README.md"
 [features]
 dstdec = []
 

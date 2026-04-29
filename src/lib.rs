@@ -43,7 +43,8 @@ impl DSDFormat {
             || self.num_channels != other.num_channels;
     }
 }
-
+///Opens a dsd file in automatic mode, will return a reader behind DSDReader trait
+/// format - output for format info
 pub fn open_dsd_auto(path: &str, format: &mut DSDFormat) -> io::Result<Box<dyn DSDReader>> {
     let mut file = File::open(path)?;
 
@@ -81,16 +82,23 @@ pub fn open_dsd_auto(path: &str, format: &mut DSDFormat) -> io::Result<Box<dyn D
 }
 
 pub trait DSDReader: Send + Sync {
+    ///Will open the supported format by current reader
     fn open(&mut self, format: &mut DSDFormat) -> io::Result<()>;
+    ///Reads the dsd chunks into channel buffers. Each mutable slice inside data equal to one channel
     fn read(&mut self, data: &mut [&mut [u8]], bytes_per_channel: usize) -> io::Result<usize>;
+    ///Seeks the reader to the percent of file percent>=0 && percent<=1. E.g seek_percent(0.3f64)
     fn seek_percent(&mut self, percent: f64) -> io::Result<()>;
+    ///Seeks the reader to sample index
     fn seek_samples(&mut self, sample_index: u64) -> io::Result<()>;
+    ///Will return current position of readed frames
     fn get_position_frames(&self) -> u64;
+    ///Will return current position in percent percent>=0 && percent<=1.
     fn get_position_percent(&self) -> f64;
-
+    ///If metadata header is presented in file it will return Some. If there is no metadata header, there will be NOne
     fn get_metadata(&self) -> Option<&DSDMeta>;
+    ///Checks if reader reached end of file
     fn eof(&self) -> bool;
-
+    ///Will reset reader to the begining of file
     fn reset(&mut self) -> io::Result<()> {
         self.seek_samples(0)
     }
@@ -232,6 +240,11 @@ mod tests {
             .map(|entry| entry.path().display().to_string())
             .collect()
     }
+    
+    
+    ///Here is the example
+    /// it wil open the specified directory and will open every supported dsd file by the current time
+    /// Very recommended to use open_dsd_auto to open dsd files, not the manual opening from the every reader
     #[test]
     fn meta_test() {
         let files = collect_files_with_extension("/mnt/hdd/Music/", &["dsf", "dff"]);
