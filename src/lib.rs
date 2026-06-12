@@ -57,10 +57,6 @@ pub fn open_dsd_auto(path: &str, format: &mut DSDFormat) -> io::Result<Box<dyn D
             // DSF file
             let mut reader = DSFReader::new(path)?;
             reader.open(format)?;
-            if let Some(meta) = reader.get_metadata() {
-                meta.pretty_print()
-            }
-
             Ok(Box::new(reader))
         }
         b"FRM8" => {

@@ -12,8 +12,6 @@ enum AudioKind {
     Dst,
 }
 
-
-
 pub fn decode_dsdiff_text(raw: &[u8]) -> String {
     if raw.len() < 2 {
         return decode_bytes(raw);
@@ -25,18 +23,13 @@ pub fn decode_dsdiff_text(raw: &[u8]) -> String {
 
 fn decode_bytes(bytes: &[u8]) -> String {
     use chardetng::EncodingDetector;
-
     let mut detector = EncodingDetector::new();
     detector.feed(bytes, true);
     let encoding = detector.guess(None, true);
-
-    // Decode the bytes
     let (decoded, _, had_errors) = encoding.decode(bytes);
-
     if had_errors {
         eprintln!("Warning: decoding had errors");
     }
-
     decoded.into_owned()
 }
 
@@ -50,7 +43,6 @@ pub struct DFFReader {
     total_frames: u64,
     read_frames: u64,
     data_start: u64,
-
     // DST support
     audio_kind: Option<AudioKind>,
     data_end: u64,
@@ -59,8 +51,13 @@ pub struct DFFReader {
     dst_channel_frame_size: usize,
     dst_decoder: Option<dst_dec::Decoder>,
     dsti_index: Vec<u64>,
+    // Base added to a raw DSTI entry to get the absolute DSTF header offset.
+    // Resolved once on first use; None until then (or if resolution failed).
+    dsti_base: Option<i64>,
+    // Absolute offset of the DST chunk payload (where FRTE starts); some
+    // encoders write DSTI offsets relative to this position.
+    dst_chunk_payload_start: u64,
     dst_frame_buf: Vec<u8>,
-
     // Metadata – populated during open()
     metadata: DSDMeta,
 }
@@ -78,7 +75,6 @@ impl DFFReader {
             total_frames: 0,
             read_frames: 0,
             data_start: 0,
-
             audio_kind: None,
             data_end: 0,
             dst_framerate: 0,
@@ -86,8 +82,9 @@ impl DFFReader {
             dst_channel_frame_size: 0,
             dst_decoder: None,
             dsti_index: Vec::new(),
+            dsti_base: None,
+            dst_chunk_payload_start: 0,
             dst_frame_buf: Vec::new(),
-
             metadata: DSDMeta::default(),
         })
     }
@@ -103,7 +100,6 @@ impl DFFReader {
             total_frames: 0,
             read_frames: 0,
             data_start: 0,
-
             audio_kind: None,
             data_end: 0,
             dst_framerate: 0,
@@ -111,8 +107,9 @@ impl DFFReader {
             dst_channel_frame_size: 0,
             dst_decoder: None,
             dsti_index: Vec::new(),
+            dsti_base: None,
+            dst_chunk_payload_start: 0,
             dst_frame_buf: Vec::new(),
-
             metadata: DSDMeta::default(),
         }
     }
@@ -127,7 +124,6 @@ impl DFFReader {
         self.file.read_u64::<BigEndian>()
     }
 
-    /// Read `len` bytes then skip the odd-byte padding if needed.
     fn read_payload(&mut self, len: u64) -> io::Result<Vec<u8>> {
         let mut buf = vec![0u8; len as usize];
         self.file.read_exact(&mut buf)?;
@@ -137,8 +133,6 @@ impl DFFReader {
         Ok(buf)
     }
 
-    /// Decode a native DSDIFF text payload and store it in `self.metadata.tags`
-    /// using `entry().or_insert()` so an earlier ID3 value is never overwritten.
     fn store_text_tag(&mut self, chunk_id: &[u8; 4], raw: &[u8]) {
         let text = decode_dsdiff_text(raw);
         if !text.is_empty() {
@@ -148,7 +142,7 @@ impl DFFReader {
                 b"DIAL" => self.metadata.album = Some(text),
                 b"DIGN" => self.metadata.genre = Some(text),
                 b"DIFC" => self.metadata.comment = Some(text),
-                _=>{}
+                _ => {}
             }
         }
     }
@@ -177,13 +171,57 @@ impl DFFReader {
     fn decode_dst_frame(&mut self, _compressed_len: usize) -> io::Result<()> {
         panic!("DST decoding is disabled; enable the `dstdec` feature")
     }
+
+    /// Absolute file offset of the DSTF chunk header for the given DST frame,
+    /// looked up through the DSTI index, or None if there is no index or its
+    /// offsets cannot be matched to the file.
+    ///
+    /// The spec says each entry is an absolute offset to the DSTF *payload*
+    /// (i.e. past the 12-byte "DSTF"+size header), but encoders disagree:
+    /// some store the header offset directly, and some store offsets relative
+    /// to the DST chunk payload (where FRTE starts) or to the frame data.
+    /// All variants differ from the spec by a constant, so we probe entry 0
+    /// against each candidate base once and cache the one that lands on "DSTF".
+    fn dsti_header_pos(&mut self, frame_nr: usize) -> io::Result<Option<u64>> {
+        if self.dsti_index.is_empty() {
+            return Ok(None);
+        }
+        if self.dsti_base.is_none() {
+            let raw0 = self.dsti_index[0] as i64;
+            let bases: [i64; 6] = [
+                -12, // spec: absolute payload offset
+                0,   // absolute header offset
+                self.dst_chunk_payload_start as i64, // relative to DST payload, header
+                self.dst_chunk_payload_start as i64 - 12, // relative to DST payload, payload
+                self.data_start as i64,                   // relative to frame data, header
+                self.data_start as i64 - 12,              // relative to frame data, payload
+            ];
+            let saved = self.file.seek(SeekFrom::Current(0))?;
+            for &base in &bases {
+                let pos = base + raw0;
+                if pos < 0 || self.file.seek(SeekFrom::Start(pos as u64)).is_err() {
+                    continue;
+                }
+                let mut magic = [0u8; 4];
+                if self.file.read_exact(&mut magic).is_ok() && &magic == b"DSTF" {
+                    self.dsti_base = Some(base);
+                    break;
+                }
+            }
+            self.file.seek(SeekFrom::Start(saved))?;
+        }
+        let base = match self.dsti_base {
+            Some(b) => b,
+            None => return Ok(None),
+        };
+        let idx = frame_nr.min(self.dsti_index.len() - 1);
+        let pos = base + self.dsti_index[idx] as i64;
+        Ok(if pos < 0 { None } else { Some(pos as u64) })
+    }
 }
 
 impl DSDReader for DFFReader {
     fn open(&mut self, format: &mut DSDFormat) -> io::Result<()> {
-        // -----------------------------------------------------------------------
-        // FRM8 / DSD  header
-        // -----------------------------------------------------------------------
         let id = self.read_id()?;
         if &id != b"FRM8" {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "not FRM8 / DFF"));
@@ -208,7 +246,6 @@ impl DSDReader for DFFReader {
         let mut channels: Option<u16> = None;
         format.is_lsb_first = false;
 
-        // Top-level chunk walk  (audio + metadata in one pass)
         while self.file.seek(SeekFrom::Current(0))? < frm8_end {
             let mut chunk_id = [0u8; 4];
             if let Err(e) = self.file.read_exact(&mut chunk_id) {
@@ -221,9 +258,6 @@ impl DSDReader for DFFReader {
             let chunk_payload_start = self.file.seek(SeekFrom::Current(0))?;
 
             match &chunk_id {
-                // -----------------------------------------------------------
-                // PROP / SND  – sample-rate, channel-count, compression type
-                // -----------------------------------------------------------
                 b"PROP" => {
                     let mut prop_id = [0u8; 4];
                     self.file.read_exact(&mut prop_id)?;
@@ -282,19 +316,18 @@ impl DSDReader for DFFReader {
                                 }
                                 _ => {}
                             }
-
                             let padded = (sub_size + 1) & !1u64;
                             self.file
                                 .seek(SeekFrom::Start(sub_payload_start + padded))?;
                         }
-                    } else {
-                        let padded = (chunk_size + 1) & !1u64;
-                        self.file
-                            .seek(SeekFrom::Start(chunk_payload_start + padded))?;
                     }
+                    // Re-align to the next top-level chunk regardless of where
+                    // the subchunk walk ended (also covers odd-sized PROP).
+                    let padded = (chunk_size + 1) & !1u64;
+                    self.file
+                        .seek(SeekFrom::Start(chunk_payload_start + padded))?;
                 }
 
-                // DSTI – DST frame index
                 b"DSTI" => {
                     let mut remaining = chunk_size;
                     self.dsti_index.clear();
@@ -302,14 +335,14 @@ impl DSDReader for DFFReader {
                         let off = self.read_be_u64()?;
                         let _len = self.file.read_u32::<BigEndian>()?;
                         remaining -= 12;
-                        self.dsti_index.push(off.saturating_sub(12));
+                        // Store raw value; resolve header-vs-payload ambiguity at lookup time.
+                        self.dsti_index.push(off);
                     }
                     let padded = (chunk_size + 1) & !1u64;
                     self.file
                         .seek(SeekFrom::Start(chunk_payload_start + padded))?;
                 }
 
-                // DSD  – uncompressed audio payload
                 b"DSD " => {
                     if audio_kind.is_none() {
                         audio_kind = Some(AudioKind::Dsd);
@@ -322,12 +355,12 @@ impl DSDReader for DFFReader {
                         .seek(SeekFrom::Start(chunk_payload_start + padded))?;
                 }
 
-                // DST  – compressed audio payload
                 b"DST " => {
                     if audio_kind.is_none() {
                         audio_kind = Some(AudioKind::Dst);
                         audio_chunk_size = chunk_size;
                         let dst_payload_start = self.file.seek(SeekFrom::Current(0))?;
+                        self.dst_chunk_payload_start = dst_payload_start;
                         self.data_end = dst_payload_start + audio_chunk_size;
 
                         let frte_id = self.read_id()?;
@@ -347,10 +380,6 @@ impl DSDReader for DFFReader {
                         .seek(SeekFrom::Start(chunk_payload_start + padded))?;
                 }
 
-                // -----------------------------------------------------------
-                // DIIN – disc information block
-                //   Sub-chunks: DITI (title), DIAR (artist), ALCH (cover art)
-                // -----------------------------------------------------------
                 b"DIIN" => {
                     let diin_end = chunk_payload_start + chunk_size;
                     while self.file.seek(SeekFrom::Current(0))? < diin_end {
@@ -368,11 +397,9 @@ impl DSDReader for DFFReader {
                             b"DITI" | b"DIAR" => {
                                 if let Ok(raw) = self.read_payload(sub_size) {
                                     self.store_text_tag(&sub_id, &raw);
-                                    // read_payload already consumed + padded
                                     continue;
                                 }
                             }
-                            // Cover art extension (AudioGate / some mastering tools)
                             b"ALCH" => {
                                 if let Ok(raw) = self.read_payload(sub_size) {
                                     self.metadata.cover_art.push(MetaPicture {
@@ -384,26 +411,18 @@ impl DSDReader for DFFReader {
                             }
                             _ => {}
                         }
-
                         let padded = (sub_size + 1) & !1u64;
                         self.file.seek(SeekFrom::Start(sub_start + padded))?;
                     }
-                    // Ensure we land exactly at diin_end even if a sub-chunk was malformed
                     self.file.seek(SeekFrom::Start(diin_end))?;
                     if diin_end & 1 != 0 {
                         self.file.seek(SeekFrom::Current(1))?;
                     }
                 }
 
-                // Top-level extended text chunks
-                //   DIAL  album
-                //   DIGN  genre
-                //   DICR  copyright
-                //   DIFC  comment / notes
                 b"DIAL" | b"DIGN" | b"DICR" | b"DIFC" => {
                     if let Ok(raw) = self.read_payload(chunk_size) {
                         self.store_text_tag(&chunk_id, &raw);
-                        // read_payload consumed + padded already
                         continue;
                     }
                     let padded = (chunk_size + 1) & !1u64;
@@ -411,10 +430,6 @@ impl DSDReader for DFFReader {
                         .seek(SeekFrom::Start(chunk_payload_start + padded))?;
                 }
 
-                // ID3  – raw ID3v2 block; takes priority, store once.
-                // Because ID3 may appear before native text chunks in some
-                // files, we store the raw bytes here and overwrite any
-                // already-parsed native tags below after the loop.
                 b"ID3 " => {
                     if self.metadata.id3_raw.is_none() {
                         if let Ok(raw) = self.read_payload(chunk_size) {
@@ -560,80 +575,45 @@ impl DSDReader for DFFReader {
                         self.pos_frames = 0;
                     }
                     Some(AudioKind::Dst) => {
-                        if self.file.seek(SeekFrom::Current(0))? >= self.data_end {
-                            return Ok(written);
-                        }
-
-                        let current_frame_nr =
-                            (self.read_frames / (self.dst_channel_frame_size as u64)) as usize;
-
-                        if !self.dsti_index.is_empty() && current_frame_nr < self.dsti_index.len() {
-                            let frame_offset = self.dsti_index[current_frame_nr];
-                            self.file.seek(SeekFrom::Start(frame_offset))?;
-
+                        // Scan forward for the next DSTF chunk from the current
+                        // position, like the reference SACD reader: this never
+                        // depends on the DSTI index, so files with non-standard
+                        // index offsets still play. DSTC (CRC) chunks are
+                        // skipped; on anything else advance one byte and rescan
+                        // so junk between frames cannot derail decoding.
+                        let mut got_frame = false;
+                        loop {
+                            let chunk_start = self.file.seek(SeekFrom::Current(0))?;
+                            if chunk_start + 12 > self.data_end {
+                                break;
+                            }
                             let chunk_id = self.read_id()?;
                             let chunk_size = self.read_be_u64()?;
-                            if &chunk_id != b"DSTF" {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    format!(
-                                        "DSTI[{}] offset {:#x} did not point to DSTF (got {:?})",
-                                        current_frame_nr,
-                                        frame_offset,
-                                        std::str::from_utf8(&chunk_id)
-                                    ),
-                                ));
-                            }
-                            let payload_start = self.file.seek(SeekFrom::Current(0))?;
-                            if payload_start + chunk_size > self.data_end {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    "DSTF payload exceeds DST chunk bounds",
-                                ));
-                            }
 
-                            let frame_len = chunk_size as usize;
-                            self.dst_frame_buf.resize(frame_len, 0);
-                            self.file.read_exact(&mut self.dst_frame_buf)?;
-                            if (frame_len & 1) != 0 {
-                                self.file.seek(SeekFrom::Current(1))?;
-                            }
-
-                            self.decode_dst_frame(frame_len)?;
-                            self.filled_frames = self.dst_channel_frame_size;
-                            self.pos_frames = 0;
-                        } else {
-                            let mut got_frame = false;
-                            while self.file.seek(SeekFrom::Current(0))? < self.data_end {
-                                let chunk_id = self.read_id()?;
-                                let chunk_size = self.read_be_u64()?;
-                                let payload_start = self.file.seek(SeekFrom::Current(0))?;
-
-                                if &chunk_id == b"DSTF" {
-                                    if payload_start + chunk_size > self.data_end {
-                                        return Ok(written);
-                                    }
-                                    let frame_len = chunk_size as usize;
-                                    self.dst_frame_buf.resize(frame_len, 0);
-                                    self.file.read_exact(&mut self.dst_frame_buf)?;
-                                    if (frame_len & 1) != 0 {
-                                        self.file.seek(SeekFrom::Current(1))?;
-                                    }
-
-                                    self.decode_dst_frame(frame_len)?;
-                                    self.filled_frames = self.dst_channel_frame_size;
-                                    self.pos_frames = 0;
-                                    got_frame = true;
+                            if &chunk_id == b"DSTF" {
+                                if chunk_start + 12 + chunk_size > self.data_end {
                                     break;
-                                } else {
-                                    let padded = (chunk_size + 1) & !1u64;
-                                    self.file.seek(SeekFrom::Start(payload_start + padded))?;
                                 }
+                                let frame_len = chunk_size as usize;
+                                self.dst_frame_buf.resize(frame_len, 0);
+                                self.file.read_exact(&mut self.dst_frame_buf)?;
+                                if (frame_len & 1) != 0 {
+                                    self.file.seek(SeekFrom::Current(1))?;
+                                }
+                                self.decode_dst_frame(frame_len)?;
+                                self.filled_frames = self.dst_channel_frame_size;
+                                self.pos_frames = 0;
+                                got_frame = true;
+                                break;
+                            } else if &chunk_id == b"DSTC" && chunk_size == 4 {
+                                self.file.seek(SeekFrom::Current(4))?;
+                            } else {
+                                self.file.seek(SeekFrom::Start(chunk_start + 1))?;
                             }
+                        }
 
-                            if !got_frame {
-                                return Ok(written);
-                            }
+                        if !got_frame {
+                            return Ok(written);
                         }
                     }
                     None => {
@@ -699,18 +679,27 @@ impl DSDReader for DFFReader {
                     return Ok(());
                 }
 
-                if self.dsti_index.is_empty() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "seeking in DST requires DSTI (frame index) support",
-                    ));
-                }
+                let max_frame = (self.dst_frame_count as usize).saturating_sub(1);
+                let target_frame = ((sample_index / (self.dst_channel_frame_size as u64))
+                    as usize)
+                    .min(max_frame);
 
-                let target_frame = (sample_index / (self.dst_channel_frame_size as u64)) as usize;
-                let target_frame = target_frame.min(self.dsti_index.len().saturating_sub(1));
+                let frame_offset = match self.dsti_header_pos(target_frame)? {
+                    Some(pos) => pos,
+                    None => {
+                        // No usable index: extrapolate from the average frame
+                        // size; the sequential scanner in read() resynchronizes
+                        // on the next DSTF header from there.
+                        let data_size = self.data_end - self.data_start;
+                        let approx = (target_frame as u64)
+                            .saturating_mul(data_size)
+                            .checked_div(self.dst_frame_count.max(1) as u64)
+                            .unwrap_or(0);
+                        self.data_start + approx.min(data_size)
+                    }
+                };
 
-                self.file
-                    .seek(SeekFrom::Start(self.dsti_index[target_frame]))?;
+                self.file.seek(SeekFrom::Start(frame_offset))?;
                 self.read_frames = (target_frame as u64) * (self.dst_channel_frame_size as u64);
                 self.pos_frames = 0;
                 self.filled_frames = 0;
