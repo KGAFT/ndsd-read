@@ -1,6 +1,6 @@
 [package]
 name = "ndsd-read"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "A lightweight library in rust for reading dsd files"
 license = "Apache-2.0"
